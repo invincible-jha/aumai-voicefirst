@@ -1,15 +1,528 @@
-# API Reference — Voicefirst
+# API Reference — aumai-voicefirst
 
-## Modules
+Complete reference for all public classes, functions, and Pydantic models in
+`aumai-voicefirst`. All public symbols are available from the modules described below.
 
-### `aumai_voicefirst.core`
+---
 
-Core logic module. Placeholder — replace with actual API documentation.
+## Module: `aumai_voicefirst.models`
 
-### `aumai_voicefirst.models`
+Pydantic data models that form the core data contract for all voice sessions, utterances,
+and configuration. Every model inherits from `pydantic.BaseModel` with strict field-level
+validation.
 
-Pydantic models. Placeholder — replace with actual model documentation.
+---
 
-### `aumai_voicefirst.cli`
+### `AudioFormat`
 
-CLI entry point. Access via `aumai-voicefirst --help`.
+Supported audio container formats. Inherits from `str` and `Enum`, making values directly
+JSON-serializable as plain strings.
+
+```python
+class AudioFormat(str, Enum):
+    wav  = "wav"
+    mp3  = "mp3"
+    ogg  = "ogg"
+    flac = "flac"
+```
+
+**Members:**
+
+| Member | Value | Description |
+|--------|-------|-------------|
+| `AudioFormat.wav` | `"wav"` | Waveform Audio File Format. Standard lossless format for speech recognition input. |
+| `AudioFormat.mp3` | `"mp3"` | MPEG Audio Layer III. Lossy compressed format, widely supported. |
+| `AudioFormat.ogg` | `"ogg"` | Ogg Vorbis. Open-source lossy format. |
+| `AudioFormat.flac` | `"flac"` | Free Lossless Audio Codec. Lossless compressed format, larger files. |
+
+**Example:**
+
+```python
+from aumai_voicefirst.models import AudioFormat
+
+fmt = AudioFormat.wav
+print(fmt)          # AudioFormat.wav
+print(fmt.value)    # wav
+print(str(fmt))     # AudioFormat.wav
+
+# Use in JSON context (str enum serializes as the string value)
+import json
+print(json.dumps({"format": fmt}))  # {"format": "wav"}
+```
+
+---
+
+### `VoiceConfig`
+
+Configuration for a voice session. Defines the language, audio properties, and format
+expected from the audio source.
+
+```python
+class VoiceConfig(BaseModel):
+    language: str
+    sample_rate: int   # ge=8000, le=48000, default=16000
+    channels: int      # ge=1, le=2, default=1
+    format: AudioFormat  # default=AudioFormat.wav
+```
+
+**Fields:**
+
+| Field | Type | Default | Constraints | Description |
+|-------|------|---------|-------------|-------------|
+| `language` | `str` | required | — | BCP-47 language code, e.g. `"en"`, `"hi"`, `"ta-IN"`. |
+| `sample_rate` | `int` | `16000` | `8000 <= n <= 48000` | Audio sample rate in Hz. 16000 Hz is recommended for speech recognition. |
+| `channels` | `int` | `1` | `1 <= n <= 2` | Number of audio channels. 1 = mono, 2 = stereo. Most STT systems expect mono. |
+| `format` | `AudioFormat` | `AudioFormat.wav` | — | Container format for the audio stream. |
+
+**Example:**
+
+```python
+from aumai_voicefirst.models import AudioFormat, VoiceConfig
+
+config = VoiceConfig(language="hi", sample_rate=16000, format=AudioFormat.wav)
+print(config.model_dump())
+# {'language': 'hi', 'sample_rate': 16000, 'channels': 1, 'format': <AudioFormat.wav: 'wav'>}
+
+# Invalid sample_rate raises ValidationError
+from pydantic import ValidationError
+try:
+    VoiceConfig(language="en", sample_rate=100)
+except ValidationError as e:
+    print(e)
+```
+
+---
+
+### `Utterance`
+
+A single recognized speech utterance produced by a speech-to-text system.
+
+```python
+class Utterance(BaseModel):
+    text: str
+    language: str
+    start_ms: float   # ge=0.0
+    end_ms: float     # ge=0.0
+    confidence: float  # ge=0.0, le=1.0
+```
+
+**Fields:**
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| `text` | `str` | — | The transcribed text content of this utterance. |
+| `language` | `str` | — | BCP-47 language code of the utterance. May differ from the session's `VoiceConfig.language` in multilingual calls. |
+| `start_ms` | `float` | `>= 0.0` | Start timestamp in milliseconds from the beginning of the audio stream. Used for transcript ordering. |
+| `end_ms` | `float` | `>= 0.0` | End timestamp in milliseconds. |
+| `confidence` | `float` | `0.0 <= n <= 1.0` | Transcription confidence score from the STT provider. 0.0 = no confidence, 1.0 = fully confident. |
+
+**Example:**
+
+```python
+from aumai_voicefirst.models import Utterance
+
+utt = Utterance(
+    text="नमस्ते",
+    language="hi",
+    start_ms=0.0,
+    end_ms=800.0,
+    confidence=0.95,
+)
+print(utt.text)       # नमस्ते
+print(utt.start_ms)   # 0.0
+print(utt.confidence) # 0.95
+
+# Duration calculation
+duration_seconds = (utt.end_ms - utt.start_ms) / 1000.0
+print(f"{duration_seconds:.2f}s")  # 0.80s
+```
+
+---
+
+### `VoiceSession`
+
+An active or completed voice interaction session. Stores the session ID, configuration,
+all utterances, and the current lifecycle state.
+
+```python
+class VoiceSession(BaseModel):
+    session_id: str
+    config: VoiceConfig
+    utterances: list[Utterance]  # default_factory=list
+    state: Literal["active", "paused", "completed", "error"]  # default="active"
+```
+
+**Fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `session_id` | `str` | required | UUID4 string generated by `VoiceSessionManager.create_session`. |
+| `config` | `VoiceConfig` | required | The audio and language configuration for this session. |
+| `utterances` | `list[Utterance]` | `[]` | Ordered list of utterances. Appended by `VoiceSessionManager.add_utterance`. Not automatically sorted — `get_transcript` handles ordering. |
+| `state` | `Literal[...]` | `"active"` | Current lifecycle state. Valid values: `"active"`, `"paused"`, `"completed"`, `"error"`. |
+
+**Valid state transitions:**
+- `active` -> `paused` (call put on hold)
+- `paused` -> `active` (call resumed)
+- `active` -> `completed` (normal call end)
+- `active` -> `error` (STT failure or stream drop)
+- `paused` -> `completed` (call ended while on hold)
+
+**Example:**
+
+```python
+from aumai_voicefirst.models import VoiceConfig, VoiceSession
+
+session = VoiceSession(
+    session_id="abc-123",
+    config=VoiceConfig(language="en"),
+)
+print(session.state)       # active
+print(session.utterances)  # []
+
+# Serialize to JSON
+json_str = session.model_dump_json(indent=2)
+
+# Deserialize from JSON
+import json
+restored = VoiceSession.model_validate(json.loads(json_str))
+print(restored.session_id)  # abc-123
+```
+
+---
+
+### `TextToSpeechConfig`
+
+Configuration for text-to-speech synthesis. Provider-agnostic — the `voice_id` is passed
+through to whichever TTS backend your application uses.
+
+```python
+class TextToSpeechConfig(BaseModel):
+    voice_id: str
+    speed: float   # ge=0.25, le=4.0, default=1.0
+    pitch: float   # ge=-20.0, le=20.0, default=0.0
+```
+
+**Fields:**
+
+| Field | Type | Default | Constraints | Description |
+|-------|------|---------|-------------|-------------|
+| `voice_id` | `str` | required | — | Provider-specific voice identifier string passed to the TTS API. |
+| `speed` | `float` | `1.0` | `0.25 <= n <= 4.0` | Playback speed multiplier. 1.0 = normal. 0.5 = half speed. 2.0 = double speed. |
+| `pitch` | `float` | `0.0` | `-20.0 <= n <= 20.0` | Pitch shift in semitones. 0.0 = no shift. Positive values raise pitch, negative lower it. |
+
+**Example:**
+
+```python
+from aumai_voicefirst.models import TextToSpeechConfig
+
+tts = TextToSpeechConfig(
+    voice_id="hindi-female-v2",
+    speed=1.1,
+    pitch=2.0,
+)
+print(tts.voice_id)  # hindi-female-v2
+print(tts.speed)     # 1.1
+print(tts.pitch)     # 2.0
+
+# Validation
+from pydantic import ValidationError
+try:
+    TextToSpeechConfig(voice_id="v1", speed=10.0)  # exceeds max 4.0
+except ValidationError as e:
+    print(e)
+```
+
+---
+
+## Module: `aumai_voicefirst.core`
+
+The operational module containing session management and language routing.
+
+---
+
+### Module-level constants
+
+#### `_INDIC_LANGUAGES`
+
+```python
+_INDIC_LANGUAGES: set[str]
+```
+
+Set of BCP-47 base codes for Indic language routing. Contains 23 codes:
+`hi`, `bn`, `te`, `ta`, `mr`, `gu`, `kn`, `ml`, `pa`, `or`, `as`, `ur`, `sa`, `si`,
+`ne`, `kok`, `mai`, `doi`, `mni`, `ks`, `sat`, `sd`, `bo`.
+
+#### `_CJK_LANGUAGES`
+
+```python
+_CJK_LANGUAGES: set[str]
+```
+
+Set of BCP-47 base codes for CJK routing: `zh`, `ja`, `ko`.
+
+#### `_ARABIC_LANGUAGES`
+
+```python
+_ARABIC_LANGUAGES: set[str]
+```
+
+Set of BCP-47 base codes for Arabic-script routing: `ar`, `fa`, `ur`, `ks`, `sd`.
+
+Note that `ur` (Urdu) and `ks` (Kashmiri) and `sd` (Sindhi) appear in both
+`_INDIC_LANGUAGES` and `_ARABIC_LANGUAGES`. In `VoiceRouter.route`, the Indic check
+runs first, so these languages route to `handler.indic`.
+
+---
+
+### `VoiceSessionManager`
+
+Manages voice interaction sessions in memory. Stores sessions in an internal dictionary
+keyed by session ID.
+
+```python
+class VoiceSessionManager:
+    def __init__(self) -> None: ...
+    def create_session(self, config: VoiceConfig) -> VoiceSession: ...
+    def add_utterance(self, session: VoiceSession, utterance: Utterance) -> None: ...
+    def get_transcript(self, session: VoiceSession) -> str: ...
+    def get_session(self, session_id: str) -> VoiceSession: ...
+```
+
+#### `VoiceSessionManager.__init__`
+
+```python
+def __init__(self) -> None
+```
+
+Initialize a new session manager with an empty internal session store.
+
+**Example:**
+
+```python
+from aumai_voicefirst.core import VoiceSessionManager
+
+manager = VoiceSessionManager()
+```
+
+---
+
+#### `VoiceSessionManager.create_session`
+
+```python
+def create_session(self, config: VoiceConfig) -> VoiceSession
+```
+
+Create a new voice session.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `config` | `VoiceConfig` | Configuration for the session (language, sample rate, format). |
+
+**Returns:** `VoiceSession` — a new session in `"active"` state with a UUID4 session ID
+and an empty utterances list. The session is stored internally and can be retrieved by ID.
+
+**Example:**
+
+```python
+from aumai_voicefirst.models import VoiceConfig
+
+config = VoiceConfig(language="ta")
+session = manager.create_session(config)
+print(session.state)       # active
+print(len(session.session_id))  # 36 (UUID4 format)
+```
+
+---
+
+#### `VoiceSessionManager.add_utterance`
+
+```python
+def add_utterance(self, session: VoiceSession, utterance: Utterance) -> None
+```
+
+Append an utterance to an existing session.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `session` | `VoiceSession` | The session to append to. Mutated in place. |
+| `utterance` | `Utterance` | The utterance to append. |
+
+**Returns:** `None`
+
+**Raises:**
+- `ValueError` — if `session.state` is not `"active"` or `"paused"`. Message format:
+  `"Cannot add utterance to session in state '{state}'."`
+
+**Example:**
+
+```python
+from aumai_voicefirst.models import Utterance
+
+utt = Utterance(text="Hello", language="en", start_ms=0.0, end_ms=500.0, confidence=0.98)
+manager.add_utterance(session, utt)
+print(len(session.utterances))  # 1
+
+# Completed session rejects utterances
+session.state = "completed"
+try:
+    manager.add_utterance(session, utt)
+except ValueError as e:
+    print(e)
+# Cannot add utterance to session in state 'completed'.
+```
+
+---
+
+#### `VoiceSessionManager.get_transcript`
+
+```python
+def get_transcript(self, session: VoiceSession) -> str
+```
+
+Return the full transcript of a session as a single string.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `session` | `VoiceSession` | The session to transcribe. |
+
+**Returns:** `str` — utterance texts joined with `"\n"`, sorted by ascending `start_ms`.
+Returns an empty string if the session has no utterances.
+
+**Notes:**
+- Sorting is stable: utterances with the same `start_ms` preserve their append order.
+- This method does not mutate the session.
+
+**Example:**
+
+```python
+transcript = manager.get_transcript(session)
+print(transcript)
+# नमस्ते, मुझे सहायता चाहिए
+# मेरा ऑर्डर रद्द हो गया
+```
+
+---
+
+#### `VoiceSessionManager.get_session`
+
+```python
+def get_session(self, session_id: str) -> VoiceSession
+```
+
+Retrieve a session by its ID.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `session_id` | `str` | The UUID4 session identifier string. |
+
+**Returns:** `VoiceSession` — the session object stored in the manager.
+
+**Raises:**
+- `KeyError` — if no session with the given ID exists in this manager instance.
+
+**Example:**
+
+```python
+retrieved = manager.get_session(session.session_id)
+print(retrieved is session)  # True — returns the same object
+
+try:
+    manager.get_session("nonexistent-id")
+except KeyError as e:
+    print(f"Not found: {e}")
+```
+
+---
+
+### `VoiceRouter`
+
+Routes voice utterances to language-specialized handlers.
+
+```python
+class VoiceRouter:
+    def route(self, utterance: Utterance) -> str: ...
+```
+
+#### `VoiceRouter.route`
+
+```python
+def route(self, utterance: Utterance) -> str
+```
+
+Determine the handler identifier for an utterance based on its language code.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `utterance` | `Utterance` | The utterance to route. The `.language` field is used for routing. |
+
+**Returns:** `str` — one of four handler identifier strings:
+
+| Return Value | Languages |
+|-------------|-----------|
+| `"handler.indic"` | `hi`, `bn`, `te`, `ta`, `mr`, `gu`, `kn`, `ml`, `pa`, `or`, `as`, `ur`, `sa`, `si`, `ne`, `kok`, `mai`, `doi`, `mni`, `ks`, `sat`, `sd`, `bo` |
+| `"handler.cjk"` | `zh`, `ja`, `ko` |
+| `"handler.arabic"` | `ar`, `fa`, `ur`, `ks`, `sd` |
+| `"handler.default"` | All other language codes |
+
+**Notes:**
+- Language matching is case-insensitive (`.lower()` is applied).
+- BCP-47 subtags are stripped: `"hi-IN"` -> `"hi"`, `"zh-Hant"` -> `"zh"`.
+- If `ur`, `ks`, or `sd` are the language, the Indic check runs first (before Arabic),
+  so they route to `"handler.indic"`.
+
+**Example:**
+
+```python
+from aumai_voicefirst.core import VoiceRouter
+from aumai_voicefirst.models import Utterance
+
+router = VoiceRouter()
+
+def make_utt(lang: str) -> Utterance:
+    return Utterance(text="test", language=lang, start_ms=0, end_ms=100, confidence=0.9)
+
+print(router.route(make_utt("hi")))    # handler.indic
+print(router.route(make_utt("hi-IN"))) # handler.indic (subtag stripped)
+print(router.route(make_utt("ja")))    # handler.cjk
+print(router.route(make_utt("ar")))    # handler.arabic
+print(router.route(make_utt("en")))    # handler.default
+print(router.route(make_utt("fr")))    # handler.default
+```
+
+---
+
+## Error Reference
+
+| Exception | Raised By | Condition |
+|-----------|-----------|-----------|
+| `ValueError` | `VoiceSessionManager.add_utterance` | Session state is not `"active"` or `"paused"`. |
+| `KeyError` | `VoiceSessionManager.get_session` | Session ID not found in the manager's store. |
+| `pydantic.ValidationError` | Any model constructor | Field constraint violated (e.g. `confidence > 1.0`, `sample_rate < 8000`). |
+
+---
+
+## Type Summary
+
+| Symbol | Module | Type |
+|--------|--------|------|
+| `AudioFormat` | `models` | `str, Enum` |
+| `VoiceConfig` | `models` | `pydantic.BaseModel` |
+| `Utterance` | `models` | `pydantic.BaseModel` |
+| `VoiceSession` | `models` | `pydantic.BaseModel` |
+| `TextToSpeechConfig` | `models` | `pydantic.BaseModel` |
+| `VoiceSessionManager` | `core` | class |
+| `VoiceRouter` | `core` | class |
+| `_INDIC_LANGUAGES` | `core` | `set[str]` |
+| `_CJK_LANGUAGES` | `core` | `set[str]` |
+| `_ARABIC_LANGUAGES` | `core` | `set[str]` |
